@@ -211,7 +211,11 @@ def _pinecone_class():
     try:
         from langchain_pinecone import PineconeVectorStore
     except ImportError as e:
-        raise ImportError("VECTOR_DB=pinecone needs the Pinecone packed, do pip install it.")    
+        raise ImportError(
+            "VECTOR_DB=pinecone needs the Pinecone package. Run: pip install langchain-pinecone"
+        ) from e
+
+    return PineconeVectorStore    
 
 
 def build_index(documents: List[Document]) -> Dict[str, int]:
@@ -263,7 +267,7 @@ def update_index(documents: List[Document]) -> Dict[str, int]:
         A summary dictionary with how many chunks were added and how many were
         skipped as duplicates.
     """
-    existing_parents, existing_children = load_vector_store()    
+    existing_parents, existing_children = load_doc_store()    
     if not existing_children:
         return build_index(documents)
     
