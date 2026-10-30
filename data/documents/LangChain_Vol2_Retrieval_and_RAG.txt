@@ -1,0 +1,1160 @@
+********************************************************************************
+
+                       LANGCHAIN HANDBOOK - VOLUME 2 OF 3
+
+                       RETRIEVAL AND DATA WITH LANGCHAIN
+
+    Loaders, Splitters, Embeddings, Vector Stores, Retrievers and RAG Chains
+
+********************************************************************************
+
+TABLE OF CONTENTS
+-----------------
+
+  1. Why Retrieval-Augmented Generation
+  2. Documents and Document Loaders
+  3. Text Splitting
+  4. Embeddings
+  5. Vector Stores
+  6. Retrievers
+  7. Building RAG Chains
+  8. Conversational RAG
+  9. Improving Retrieval Quality
+  10. Evaluating RAG Applications
+  11. Troubleshooting and Checklist
+
+--------------------------------------------------------------------------------
+
+
+1. WHY RETRIEVAL-AUGMENTED GENERATION
+=====================================
+
+1.1 The problem RAG solves
+--------------------------
+
+A language model knows what it learned during training, and nothing else. It
+does not know your company's policies, last week's release notes, the contents
+of a private PDF or the rows of a database. It also cannot tell you where its
+knowledge came from, and when it lacks knowledge it may produce a confident but
+invented answer. Retrieval-augmented generation, usually shortened to RAG,
+addresses these limitations by changing what goes into the prompt. Instead of
+asking the model to recall facts, the application first searches a collection of
+documents for passages that are relevant to the question, and then asks the
+model to answer using only those passages.
+
+This approach has several advantages. The knowledge can be updated by changing
+the documents, with no retraining. Answers can cite their sources, which lets
+users verify them. Private data stays under your control and is sent to the
+model only in small, relevant pieces. And the model's task becomes easier and
+more reliable: reading and summarising supplied text is something language
+models do far better than recalling obscure facts.
+
+1.2 The two phases
+------------------
+
+Every RAG system has two phases. The indexing phase runs ahead of time, or
+whenever documents change. It loads documents from their sources, splits them
+into chunks, converts each chunk into a numeric vector called an embedding, and
+stores the vectors in a vector store. The query phase runs for every user
+question. It converts the question into an embedding, retrieves the most similar
+chunks, places them in a prompt together with the question, and asks the model
+to answer.
+
+    ---- code ------------------------------------------------------------
+    INDEXING (offline)
+      Source files -> Loader -> Documents -> Splitter -> Chunks
+                                                           |
+                                      Embedding model <----+
+                                           |
+                                      Vector store
+
+    QUERY (online)
+      Question -> Embedding -> Vector store search -> Top chunks
+                                                           |
+                           Prompt (question + chunks) <----+
+                                           |
+                                      Chat model -> Answer (with sources)
+    ----------------------------------------------------------------------
+
+1.3 How this volume is organised
+--------------------------------
+
+The chapters follow the pipeline in order: loaders, splitters, embeddings,
+vector stores, retrievers, and finally complete chains. A later chapter adds
+conversation history, and the last chapters cover evaluation and
+troubleshooting. Each chapter ends with the pitfalls that most often cause poor
+answers. The most important lesson of the volume is that RAG quality is
+determined mostly by the quality of retrieval. If the right passage never
+reaches the prompt, no model can answer correctly, so most of the effort should
+go into the earlier stages.
+
+  +--------------------------------------------------------------------------+
+  | NOTE: Some retriever helpers and older chain classes were moved to a     |
+  | separate legacy package in recent LangChain releases. If an import in    |
+  | this volume fails on your installation, search the documentation for the |
+  | class name to find its current location. The concepts do not change.     |
+  +--------------------------------------------------------------------------+
+
+
+2. DOCUMENTS AND DOCUMENT LOADERS
+=================================
+
+2.1 The Document object
+-----------------------
+
+LangChain represents a piece of text with its metadata as a `Document`. It has
+two main fields: `page_content`, a string, and `metadata`, a dictionary.
+Metadata travels with the text through splitting, embedding and retrieval, and
+is what makes citations and filtering possible. Good metadata design is one of
+the cheapest ways to improve a RAG system.
+
+    ---- code ------------------------------------------------------------
+    from langchain_core.documents import Document
+
+    doc = Document(
+        page_content="Refunds are issued within 14 days of a return request.",
+        metadata={"source": "policy.pdf", "page": 3, "department": "support"},
+    )
+    ----------------------------------------------------------------------
+
+2.2 Loaders
+-----------
+
+A document loader reads data from a source and returns a list of `Document`
+objects. LangChain includes loaders for text files, PDFs, web pages, CSV files,
+Word and PowerPoint files, Markdown, JSON, databases, cloud storage and many
+software-as-a-service tools. All loaders share the same two methods: `load`
+returns a list, and `lazy_load` returns an iterator that yields one document at
+a time, which is better for large collections because it does not hold
+everything in memory.
+
+    ---- code ------------------------------------------------------------
+    from langchain_community.document_loaders import (
+        TextLoader, PyPDFLoader, WebBaseLoader, CSVLoader)
+
+    text_docs = TextLoader("notes.txt", encoding="utf-8").load()
+
+    pdf_docs = PyPDFLoader("handbook.pdf").load()     # one Document per page
+    print(pdf_docs[0].metadata)         # {'source': ..., 'page': 0}
+
+    web_docs = WebBaseLoader("https://example.com/docs/intro").load()
+
+    csv_docs = CSVLoader("tickets.csv").load()        # one Document per row
+    ----------------------------------------------------------------------
+
+2.3 Loading a whole directory
+-----------------------------
+
+To ingest a folder, use `DirectoryLoader` with a glob pattern and a loader class
+for the matching files. Setting `show_progress` helps with large folders, and
+`use_multithreading` speeds up loading many small files.
+
+    ---- code ------------------------------------------------------------
+    from langchain_community.document_loaders import DirectoryLoader
+
+    loader = DirectoryLoader(
+        "./knowledge_base",
+        glob="**/*.md",
+        loader_cls=TextLoader,
+        loader_kwargs={"encoding": "utf-8"},
+        show_progress=True,
+    )
+    docs = loader.load()
+    print(len(docs), "documents loaded")
+    ----------------------------------------------------------------------
+
+2.4 Parsing quality matters
+---------------------------
+
+The loader is the first place where information can be lost, and this loss
+cannot be repaired later. PDFs are the classic example. They store the position
+of glyphs rather than paragraphs, so a naive extraction may interleave the
+columns of a two-column page, merge a table into a stream of numbers, or include
+running headers and page numbers in every chunk. Always read a sample of the
+loaded text with your own eyes. If the extraction is poor, try a different
+loader, a layout-aware parser or an OCR step for scanned pages.
+
+A short checklist for inspecting loaded documents:
+
+  1. Is the reading order correct for multi-column pages?
+  2. Are headers, footers and navigation menus repeated in every page?
+  3. Are tables preserved as structured text, with their header rows?
+  4. Is the text free of broken characters and stray hyphenation?
+  5. Does the metadata include a source, and a page or section where possible?
+
+2.5 Adding and cleaning metadata
+--------------------------------
+
+Add the metadata you will need later at loading time. Useful fields include the
+source file or URL, the title, the author, the creation or modification date,
+the document type, the language, the product or version it describes, and an
+access-control tag. These fields allow you to filter retrieval, to show
+citations and to delete or refresh one document without rebuilding the entire
+index.
+
+    ---- code ------------------------------------------------------------
+    import hashlib
+
+    def enrich(docs, doc_type, version):
+        for d in docs:
+            d.metadata["doc_type"] = doc_type
+            d.metadata["version"] = version
+            digest = hashlib.sha256(d.page_content.encode()).hexdigest()
+            d.metadata["content_hash"] = digest[:16]
+        return docs
+
+    pdf_docs = enrich(pdf_docs, doc_type="handbook", version="2025.2")
+    ----------------------------------------------------------------------
+
+The content hash lets you detect unchanged documents during re-ingestion so that
+you only embed what is new.
+
+2.6 Writing a custom loader
+---------------------------
+
+If your data lives in an internal system, write a small loader by subclassing
+`BaseLoader` and implementing `lazy_load`. The rest of the pipeline will not
+care where the documents came from.
+
+    ---- code ------------------------------------------------------------
+    from typing import Iterator
+    from langchain_core.document_loaders import BaseLoader
+
+    class TicketLoader(BaseLoader):
+        def __init__(self, rows):
+            self.rows = rows            # e.g. dictionaries from your database
+
+        def lazy_load(self) -> Iterator[Document]:
+            for r in self.rows:
+                yield Document(
+                    page_content=f"{r['subject']}\n\n{r['body']}",
+                    metadata={"source": f"ticket/{r['id']}",
+                              "status": r["status"]},
+                )
+    ----------------------------------------------------------------------
+
+
+3. TEXT SPLITTING
+=================
+
+3.1 Why documents must be split
+-------------------------------
+
+A complete document is usually too long to place in a prompt, and an embedding
+of a whole document is a blurry summary of everything in it. Splitting breaks
+documents into chunks that are small enough to embed precisely and to fit
+several at a time in the prompt. The trade-off is that a chunk that is too small
+loses context, and a chunk that is too large dilutes the embedding and wastes
+prompt space.
+
+3.2 The recursive splitter
+--------------------------
+
+The recommended general-purpose splitter is `RecursiveCharacterTextSplitter`. It
+tries to split on the largest natural boundary first, which is a blank line
+between paragraphs. If a piece is still larger than the chunk size, it falls
+back to a single newline, then a space, then individual characters. The effect
+is that paragraphs and sentences stay together whenever possible.
+
+    ---- code ------------------------------------------------------------
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,          # characters by default
+        chunk_overlap=120,
+        add_start_index=True,    # records the offset in metadata
+    )
+    chunks = splitter.split_documents(pdf_docs)
+    print(len(chunks), "chunks; first:", chunks[0].metadata)
+    ----------------------------------------------------------------------
+
+The `chunk_overlap` parameter repeats the end of one chunk at the start of the
+next. Overlap protects against a fact that straddles a boundary, at the price of
+storing some text twice. Ten to twenty percent of the chunk size is a common
+range.
+
+3.3 Measuring size in tokens
+----------------------------
+
+Models and embedding models limit input in tokens, not characters. When
+precision matters, build the splitter from a tokenizer so that sizes are
+measured in the same unit the model uses.
+
+    ---- code ------------------------------------------------------------
+    splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        encoding_name="cl100k_base",
+        chunk_size=300,
+        chunk_overlap=40,
+    )
+    ----------------------------------------------------------------------
+
+3.4 Structure-aware splitting
+-----------------------------
+
+If your documents have structure, use it. A Markdown header splitter creates one
+chunk per section and records the heading hierarchy in metadata. You can then
+prepend the heading path to the chunk text before embedding, which gives every
+chunk the context of where it sits in the document.
+
+    ---- code ------------------------------------------------------------
+    from langchain_text_splitters import MarkdownHeaderTextSplitter
+
+    md_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=[("#", "h1"), ("##", "h2"), ("###", "h3")]
+    )
+    sections = md_splitter.split_text(markdown_text)
+    for s in sections:
+        path = " > ".join(s.metadata[k] for k in ("h1", "h2", "h3")
+                          if k in s.metadata)
+        s.page_content = f"{path}\n\n{s.page_content}"
+    ----------------------------------------------------------------------
+
+Source code has its own splitters, created with
+`RecursiveCharacterTextSplitter.from_language`, which respect function and class
+boundaries for many programming languages.
+
+3.5 Choosing chunk size
+-----------------------
+
+There is no universally best chunk size. Factual questions favour small chunks
+of a few hundred tokens, while explanatory questions benefit from larger ones. A
+practical way to choose is to build a small set of real questions with known
+answer passages, try two or three sizes, and compare how often the right passage
+appears in the top results. The common range is 200 to 800 tokens. Another
+approach is to retrieve small chunks but give the model a larger surrounding
+block, which Chapter 6 describes as the parent-document pattern.
+
+3.6 Splitting pitfalls
+----------------------
+
+  * Splitting before cleaning, so headers and footers end up inside chunks.
+  * Using a chunk size larger than the embedding model's input limit, which
+    silently truncates the text.
+  * Splitting tables or code in the middle, which makes the pieces meaningless.
+  * Forgetting to keep the metadata, so that citations become impossible.
+  * Setting overlap to zero and losing facts that fall on a boundary.
+
+
+4. EMBEDDINGS
+=============
+
+4.1 What an embedding is
+------------------------
+
+An embedding model converts text into a list of numbers, typically several
+hundred to a few thousand, called a vector. The model is trained so that texts
+with similar meaning receive vectors that point in similar directions. Searching
+for relevant passages therefore becomes a geometric problem: find the stored
+vectors closest to the question's vector. Closeness is usually measured with
+cosine similarity, which compares direction, or with the dot product on
+normalised vectors, which is equivalent.
+
+4.2 The embeddings interface
+----------------------------
+
+LangChain wraps each embedding model in a class with two methods.
+`embed_documents` takes a list of strings and returns a list of vectors, and is
+used during indexing. `embed_query` takes one string and returns one vector, and
+is used for the question. They are separate because some models apply different
+instructions or prefixes to documents and queries.
+
+    ---- code ------------------------------------------------------------
+    from langchain_huggingface import HuggingFaceEmbeddings
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+    vec = embeddings.embed_query("How do refunds work?")
+    print(len(vec))                       # dimension, for example 384
+
+    doc_vecs = embeddings.embed_documents(["Refunds take 14 days.", "Hello"])
+    ----------------------------------------------------------------------
+
+Hosted alternatives, such as the OpenAI or Cohere embedding APIs, follow the
+same interface. A local open-source model avoids per-token cost and keeps data
+on your machine, while a hosted model is easier to operate and may offer higher
+quality or better multilingual coverage.
+
+4.3 Choosing an embedding model
+-------------------------------
+
+Consider these factors:
+
+  1. Quality on your data. Public leaderboards give a starting shortlist, but
+     test two or three candidates on your own questions.
+  2. Language. If your documents or users use several languages, choose a
+     multilingual model and test it with mixed-language queries.
+  3. Dimension and speed. Larger vectors cost more memory and search time.
+  4. Maximum input length. It must exceed your chunk size.
+  5. Prefixes. Some retrieval models expect the text "query:" or "passage:"
+     before inputs. Forgetting them reduces quality.
+  6. Cost and privacy. Local models are free to run and private. Hosted models
+     bill per token.
+
+  +--------------------------------------------------------------------------+
+  | WARNING: Vectors produced by different embedding models cannot be        |
+  | compared with each other. If you change the embedding model, you must    |
+  | re-embed the entire collection and rebuild the index. Record the model   |
+  | name alongside the index.                                                |
+  +--------------------------------------------------------------------------+
+
+4.4 Measuring similarity yourself
+---------------------------------
+
+It helps to build intuition by computing similarity directly. The code below
+embeds three sentences and compares them. You will see that a paraphrase scores
+much higher than an unrelated sentence, even when it shares no words.
+
+    ---- code ------------------------------------------------------------
+    import numpy as np
+
+    a, b, c = embeddings.embed_documents([
+        "How do I get my money back?",
+        "What is the refund procedure?",
+        "The stadium holds forty thousand people.",
+    ])
+    def cos(x, y):
+        return float(np.dot(x, y) /
+                     (np.linalg.norm(x) * np.linalg.norm(y)))
+    print(cos(a, b), cos(a, c))     # first is clearly higher
+    ----------------------------------------------------------------------
+
+4.5 Caching embeddings
+----------------------
+
+Embedding a large collection takes time and, with hosted models, money. If the
+same text is embedded repeatedly during experiments or re-ingestion, a caching
+wrapper stores results keyed by a hash of the text, so each unique text is
+embedded only once.
+
+    ---- code ------------------------------------------------------------
+    from langchain.embeddings import CacheBackedEmbeddings
+    from langchain.storage import LocalFileStore
+
+    store = LocalFileStore("./embedding_cache")
+    cached = CacheBackedEmbeddings.from_bytes_store(
+        embeddings, store, namespace="minilm-v1")
+    ----------------------------------------------------------------------
+
+The namespace should include the model name so that a change of model does not
+reuse stale vectors. Depending on your installed version, this helper may live
+in a different package; check the current documentation.
+
+
+5. VECTOR STORES
+================
+
+5.1 The role of the store
+-------------------------
+
+A vector store holds the chunk texts, their metadata and their embeddings, and
+answers the question: which stored vectors are nearest to this query vector? For
+small collections an exact comparison against every vector is fine. For millions
+of vectors, stores use approximate nearest-neighbour indexes, which are much
+faster and lose a small amount of accuracy. LangChain defines one interface for
+all vector stores, so the code that uses the store does not change when you move
+from a laptop prototype to a production database.
+
+5.2 A first store
+-----------------
+
+The simplest store lives in memory and needs no installation. It is ideal for
+tutorials and tests.
+
+    ---- code ------------------------------------------------------------
+    from langchain_core.vectorstores import InMemoryVectorStore
+
+    store = InMemoryVectorStore(embeddings)
+    ids = store.add_documents(chunks)
+
+    hits = store.similarity_search("How long do refunds take?", k=3)
+    for h in hits:
+        print(h.metadata.get("source"), "|", h.page_content[:80])
+    ----------------------------------------------------------------------
+
+5.3 Persistent stores
+---------------------
+
+Data in memory disappears when the process ends. For persistence, choose a store
+that writes to disk or runs as a server. Chroma is a popular local option; FAISS
+is a fast library for similarity search that can be saved to a folder. Larger
+deployments use managed or self-hosted databases such as Postgres with a vector
+extension, Qdrant, Weaviate, Pinecone or Elasticsearch.
+
+    ---- code ------------------------------------------------------------
+    from langchain_chroma import Chroma
+
+    vs = Chroma(
+        collection_name="handbook",
+        embedding_function=embeddings,
+        persist_directory="./chroma_db",
+    )
+    vs.add_documents(chunks)
+
+    # FAISS alternative
+    from langchain_community.vectorstores import FAISS
+    faiss_vs = FAISS.from_documents(chunks, embeddings)
+    faiss_vs.save_local("faiss_index")
+    loaded = FAISS.load_local(
+        "faiss_index", embeddings, allow_dangerous_deserialization=True)
+    ----------------------------------------------------------------------
+
+The `allow_dangerous_deserialization` flag exists because loading a FAISS index
+uses Python's pickle format, which can execute code. Only load index files that
+you created yourself.
+
+5.4 Searching
+-------------
+
+Stores offer several search methods. `similarity_search` returns documents.
+`similarity_search_with_score` also returns a score, whose meaning depends on
+the store: some return a distance where lower is better, others a similarity
+where higher is better. Always check the documentation of your store before
+setting a threshold.
+
+    ---- code ------------------------------------------------------------
+    results = vs.similarity_search_with_score("refund policy", k=4)
+    for doc, score in results:
+        print(round(score, 3), doc.metadata["source"])
+
+    # metadata filter: restrict to one document type
+    filtered = vs.similarity_search(
+        "refund policy", k=4, filter={"doc_type": "handbook"})
+    ----------------------------------------------------------------------
+
+5.5 Maximal marginal relevance
+------------------------------
+
+Plain similarity search often returns near-duplicates, such as four copies of
+the same paragraph from different versions of a document. Maximal marginal
+relevance, or MMR, chooses results that are both relevant and different from
+each other. It first fetches a larger candidate set, and then selects results
+that balance relevance against redundancy.
+
+    ---- code ------------------------------------------------------------
+    diverse = vs.max_marginal_relevance_search(
+        "refund policy", k=4, fetch_k=20, lambda_mult=0.6)
+    ----------------------------------------------------------------------
+
+A `lambda_mult` of 1 means pure relevance, and 0 means pure diversity. Values
+between 0.5 and 0.8 are typical.
+
+5.6 Updating and deleting
+-------------------------
+
+Real collections change. Give each chunk a stable identifier so that you can
+update or delete it. A good identifier combines the source document, the chunk
+position and a hash of the text. When a source document changes, delete all
+chunks that belong to it and add the new ones.
+
+    ---- code ------------------------------------------------------------
+    ids = [f"{c.metadata['source']}:{i}" for i, c in enumerate(chunks)]
+    vs.add_documents(chunks, ids=ids)
+
+    vs.delete(ids=["policy.pdf:0", "policy.pdf:1"])
+    ----------------------------------------------------------------------
+
+5.7 Vector store pitfalls
+-------------------------
+
+  * Re-running ingestion and creating duplicate chunks because identifiers were
+    random.
+  * Mixing vectors from different embedding models in one collection.
+  * Comparing scores between stores or models as if they had the same scale.
+  * Filtering after retrieval, which can leave too few results, instead of using
+    the store's own filter.
+  * Leaving personal or confidential data in an index that more people can query
+    than should see it.
+
+5.8 Choosing a vector store
+---------------------------
+
+The right store depends on scale, operations and features rather than on
+benchmark speed alone. For a prototype, an in-memory store or a local Chroma or
+FAISS index is enough. When the data must be shared by several services, or
+exceeds a few million vectors, move to a server-based store. If your team
+already runs Postgres, a vector extension keeps everything in one database,
+which simplifies backups, permissions and joins with relational data. Check four
+features before deciding: metadata filtering that works efficiently with
+selective filters, support for hybrid keyword and vector search, support for
+updates and deletes by identifier, and the ability to isolate data by tenant or
+user.
+
+
+6. RETRIEVERS
+=============
+
+6.1 The retriever interface
+---------------------------
+
+A retriever takes a string query and returns a list of documents. It is a
+Runnable, so it plugs directly into chains. Any vector store can produce a
+retriever with `as_retriever`, and the same interface is implemented by keyword
+search, web search and custom logic. Because retrievers share an interface, you
+can improve retrieval without touching the rest of the chain.
+
+    ---- code ------------------------------------------------------------
+    retriever = vs.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 4},
+    )
+    docs = retriever.invoke("What is the refund window?")
+    ----------------------------------------------------------------------
+
+Other search types are `mmr` for diverse results and
+`similarity_score_threshold`, which returns only results above a score. A
+threshold is useful because it lets the system return nothing when nothing is
+relevant, rather than always returning the top four weak matches.
+
+    ---- code ------------------------------------------------------------
+    mmr_retriever = vs.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 4, "fetch_k": 20, "lambda_mult": 0.6},
+    )
+
+    strict = vs.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={"score_threshold": 0.5, "k": 6},
+    )
+    ----------------------------------------------------------------------
+
+6.2 Multi-query retrieval
+-------------------------
+
+A single phrasing of a question may miss relevant passages that use different
+words. The multi-query retriever asks a language model to generate several
+variants of the question, retrieves for each, and merges the unique results.
+
+    ---- code ------------------------------------------------------------
+    from langchain.retrievers.multi_query import MultiQueryRetriever
+
+    mq = MultiQueryRetriever.from_llm(retriever=retriever, llm=model)
+    docs = mq.invoke("How can I return a product?")
+    ----------------------------------------------------------------------
+
+6.3 Keyword and hybrid retrieval
+--------------------------------
+
+Embeddings capture meaning but can blur exact identifiers such as part numbers,
+error codes and names. Keyword search with the BM25 algorithm matches exact
+terms. Combining the two, called hybrid retrieval, is among the most dependable
+improvements. LangChain's ensemble retriever merges the ranked lists with
+weighted reciprocal rank fusion.
+
+    ---- code ------------------------------------------------------------
+    from langchain_community.retrievers import BM25Retriever
+    from langchain.retrievers import EnsembleRetriever
+
+    bm25 = BM25Retriever.from_documents(chunks)
+    bm25.k = 6
+
+    hybrid = EnsembleRetriever(
+        retrievers=[bm25, vs.as_retriever(search_kwargs={"k": 6})],
+        weights=[0.4, 0.6],
+    )
+    docs = hybrid.invoke("error E4021 during firmware update")
+    ----------------------------------------------------------------------
+
+6.4 The parent-document pattern
+-------------------------------
+
+Small chunks make precise matches, but a small chunk may lack the context needed
+to answer. The parent-document retriever embeds small child chunks for search,
+and returns the larger parent chunk to which the best child belongs. You get
+precise matching and generous context together.
+
+    ---- code ------------------------------------------------------------
+    from langchain.retrievers import ParentDocumentRetriever
+    from langchain.storage import InMemoryStore
+
+    parent_split = RecursiveCharacterTextSplitter(chunk_size=1800)
+    child_split = RecursiveCharacterTextSplitter(chunk_size=300)
+
+    pdr = ParentDocumentRetriever(
+        vectorstore=Chroma(collection_name="children",
+                           embedding_function=embeddings),
+        docstore=InMemoryStore(),
+        child_splitter=child_split,
+        parent_splitter=parent_split,
+    )
+    pdr.add_documents(pdf_docs)
+    context_docs = pdr.invoke("What are the warranty exclusions?")
+    ----------------------------------------------------------------------
+
+6.5 Contextual compression
+--------------------------
+
+Even a relevant chunk may contain mostly irrelevant sentences. A compression
+step reduces each retrieved document to the part that matters for the query,
+saving tokens and reducing distraction. A related and very effective technique
+is reranking: retrieve a generous number of candidates, such as fifty, then use
+a more accurate cross-encoder model to reorder them and keep only the best five.
+
+    ---- code ------------------------------------------------------------
+    from langchain.retrievers import ContextualCompressionRetriever
+    from langchain.retrievers.document_compressors import LLMChainExtractor
+
+    compressor = LLMChainExtractor.from_llm(model)
+    compressed = ContextualCompressionRetriever(
+        base_compressor=compressor, base_retriever=retriever)
+    ----------------------------------------------------------------------
+
+LLM-based compression adds a model call per document, which costs time and
+money. Evaluate whether it improves answers before adopting it.
+
+6.6 Metadata filters and self-query
+-----------------------------------
+
+Questions often contain constraints that are better expressed as filters than as
+meaning: "policies from 2024", "tickets from the billing team". You can apply a
+filter yourself when the application knows the constraint, for example from the
+logged-in user's department. A self-query retriever instead asks a model to turn
+the natural-language question into a semantic query plus a structured filter,
+based on a description of your metadata fields.
+
+6.7 A custom retriever
+----------------------
+
+Any function that returns documents can become a retriever. Subclass
+`BaseRetriever` and implement `_get_relevant_documents`. This is useful for
+wrapping an existing search service or for combining several sources with your
+own logic.
+
+    ---- code ------------------------------------------------------------
+    from langchain_core.retrievers import BaseRetriever
+
+    class KeywordFirstRetriever(BaseRetriever):
+        primary: BaseRetriever
+        fallback: BaseRetriever
+
+        def _get_relevant_documents(self, query, *, run_manager):
+            docs = self.primary.invoke(query)
+            return docs if docs else self.fallback.invoke(query)
+    ----------------------------------------------------------------------
+
+
+7. BUILDING RAG CHAINS
+======================
+
+7.1 The basic chain
+-------------------
+
+With a retriever, a prompt and a model, the RAG chain is a few lines of LCEL.
+The retriever finds documents, a small function formats them into a single
+string, the prompt places that string and the question into messages, and the
+model answers.
+
+    ---- code ------------------------------------------------------------
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.runnables import RunnablePassthrough
+
+    def format_docs(docs):
+        return "\n\n".join(
+            f"[{i}] ({d.metadata.get('source')}) {d.page_content}"
+            for i, d in enumerate(docs, start=1))
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "Answer using ONLY the context below. Cite sources like [1]. "
+         "If the context does not contain the answer, say you could not "
+         "find it.\n\nContext:\n{context}"),
+        ("human", "{question}"),
+    ])
+
+    rag_chain = (
+        {"context": retriever | format_docs,
+         "question": RunnablePassthrough()}
+        | prompt
+        | model
+        | StrOutputParser()
+    )
+
+    print(rag_chain.invoke("What is the refund window?"))
+    ----------------------------------------------------------------------
+
+Notice the dictionary at the start. It is a parallel step: the retriever and the
+passthrough both receive the question, and the results become the two variables
+of the prompt. Notice also the numbered sources. Giving each passage an
+identifier and asking for citations lets users check claims, and gives you a way
+to detect answers that cite nothing.
+
+7.2 Returning the sources with the answer
+-----------------------------------------
+
+Applications usually need the retrieved documents as well as the answer, for
+example to show a list of sources. Build the chain so that it keeps the
+documents in the output.
+
+    ---- code ------------------------------------------------------------
+    from langchain_core.runnables import RunnableParallel
+
+    answer_chain = prompt | model | StrOutputParser()
+
+    rag_with_sources = (
+        RunnableParallel(docs=retriever, question=RunnablePassthrough())
+        .assign(context=lambda x: format_docs(x["docs"]))
+        .assign(answer=answer_chain)
+        .pick(["answer", "docs"])
+    )
+
+    out = rag_with_sources.invoke("What is the refund window?")
+    print(out["answer"])
+    print([d.metadata["source"] for d in out["docs"]])
+    ----------------------------------------------------------------------
+
+7.3 Prompting for faithful answers
+----------------------------------
+
+The prompt is where you set the behaviour that users will notice. Four
+instructions are worth including. First, answer only from the context. Second,
+say explicitly that the correct response is "I could not find this" when the
+context lacks the answer, because models will otherwise try to be helpful by
+guessing. Third, require citations. Fourth, tell the model what to do when
+passages conflict, for example to prefer the most recent and to mention the
+disagreement.
+
+7.4 Streaming the answer
+------------------------
+
+Because the RAG chain is a Runnable, it streams like any other. Retrieval
+happens first, and then tokens arrive as the model generates them.
+
+    ---- code ------------------------------------------------------------
+    for token in rag_chain.stream("Summarise the warranty terms."):
+        print(token, end="", flush=True)
+    ----------------------------------------------------------------------
+
+7.5 Controlling how much context is sent
+----------------------------------------
+
+More context is not always better. Irrelevant passages distract the model,
+increase cost and slow the response. Retrieve a generous candidate set, then
+reduce it with a score threshold, reranking or compression to a small number of
+high-quality passages, usually between three and eight. Place the most relevant
+passages first, and consider that models tend to use the beginning and end of a
+long context more reliably than the middle.
+
+7.6 Handling questions with no answer
+-------------------------------------
+
+A RAG system must know when to stop. If the best retrieved passages are only
+weakly related to the question, the safest response is to say so. Two signals
+help. The first is a similarity threshold on retrieval: when no passage passes
+it, skip generation and return a message that nothing relevant was found. The
+second is the instruction in the prompt that allows the model to decline. Test
+both with questions that the documents cannot answer, and measure how often each
+question is wrongly answered or wrongly refused, because the two errors trade
+off against each other.
+
+
+8. CONVERSATIONAL RAG
+=====================
+
+8.1 The follow-up problem
+-------------------------
+
+In a conversation, users ask follow-up questions that cannot be understood
+alone: "And what about for international orders?" If you embed that sentence
+directly, the search will fail. The solution is to rewrite the latest message
+into a standalone question using the conversation history, and to use the
+rewritten question for retrieval, while the answer itself is still generated
+with the full conversation.
+
+    ---- code ------------------------------------------------------------
+    from langchain_core.prompts import MessagesPlaceholder
+
+    condense_prompt = ChatPromptTemplate.from_messages([
+        ("system", "Rewrite the user's last message as a standalone question, "
+                   "using the chat history to resolve references. If it is "
+                   "already standalone, return it unchanged. Output only the "
+                   "question."),
+        MessagesPlaceholder("history"),
+        ("human", "{question}"),
+    ])
+    condense = condense_prompt | model | StrOutputParser()
+    ----------------------------------------------------------------------
+
+8.2 Putting it together
+-----------------------
+
+The conversational chain first condenses the question when there is history,
+retrieves with the standalone question, and then answers using the history and
+the retrieved context.
+
+    ---- code ------------------------------------------------------------
+    qa_prompt = ChatPromptTemplate.from_messages([
+        ("system", "Answer using only this context. "
+                   "Cite sources.\n\n{context}"),
+        MessagesPlaceholder("history"),
+        ("human", "{question}"),
+    ])
+
+    def standalone(x):
+        return condense.invoke(x) if x["history"] else x["question"]
+
+    conv_rag = (
+        RunnablePassthrough.assign(
+            context=lambda x: format_docs(retriever.invoke(standalone(x))))
+        | qa_prompt | model | StrOutputParser()
+    )
+    ----------------------------------------------------------------------
+
+8.3 Storing the history
+-----------------------
+
+The chain above expects the caller to supply the history.
+`RunnableWithMessageHistory` wraps a chain so that history is loaded and saved
+automatically for a session identifier. For production, back the history with a
+database, and cap its size.
+
+    ---- code ------------------------------------------------------------
+    from langchain_core.chat_history import InMemoryChatMessageHistory
+    from langchain_core.runnables.history import RunnableWithMessageHistory
+
+    sessions = {}
+    def get_history(session_id: str):
+        return sessions.setdefault(session_id, InMemoryChatMessageHistory())
+
+    chat_rag = RunnableWithMessageHistory(
+        conv_rag, get_history,
+        input_messages_key="question",
+        history_messages_key="history",
+    )
+
+    cfg = {"configurable": {"session_id": "user-42"}}
+    chat_rag.invoke({"question": "What is the return window?"}, config=cfg)
+    chat_rag.invoke({"question": "And for international orders?"}, config=cfg)
+    ----------------------------------------------------------------------
+
+  +--------------------------------------------------------------------------+
+  | TIP: For new projects that need memory, tool use and multi-step          |
+  | behaviour, the current recommendation is to build the application as an  |
+  | agent or graph with persistence built in. Volume 3 describes this. The   |
+  | pattern above remains a clean choice for simple question-answering       |
+  | assistants.                                                              |
+  +--------------------------------------------------------------------------+
+
+8.4 Agentic retrieval
+---------------------
+
+In the chains above, retrieval always happens exactly once. Sometimes the model
+should decide whether to retrieve, what to search for, or whether to search
+again after seeing poor results. Exposing the retriever as a tool lets an agent
+make those decisions. This costs more calls and is less predictable, so it is
+best reserved for questions that need several searches, such as comparisons. The
+next volume shows how to build it.
+
+
+9. IMPROVING RETRIEVAL QUALITY
+==============================
+
+9.1 A diagnostic mindset
+------------------------
+
+When answers are wrong, find out which stage failed before changing anything.
+Print the retrieved chunks for the failing question and ask three things. Was
+the answer in the retrieved chunks? If not, retrieval failed, and the cause lies
+in loading, splitting, embeddings, query formulation or search settings. If yes,
+was it ranked high and included in the prompt? If not, adjust the number of
+results, reranking or ordering. If it was included, the generation step failed,
+and the prompt or model needs attention.
+
+9.2 Techniques and when to use them
+-----------------------------------
+
++------------------------+-----------------------+----------------------------+
+| Symptom                | Likely cause          | Technique to try           |
++========================+=======================+============================+
+| Right document, wrong  | Chunks too large or   | Smaller chunks; parent-    |
+| passage                | unfocused             | document retrieval         |
++------------------------+-----------------------+----------------------------+
+| Answer split across    | Boundary cut a fact   | Larger overlap; structure- |
+| chunks                 |                       | aware splitting            |
++------------------------+-----------------------+----------------------------+
+| Exact codes or names   | Embeddings blur       | Hybrid retrieval with BM25 |
+| missed                 | identifiers           |                            |
++------------------------+-----------------------+----------------------------+
+| User wording differs   | Vocabulary gap        | Multi-query; query         |
+| from documents         |                       | rewriting                  |
++------------------------+-----------------------+----------------------------+
+| Many near-duplicate    | Redundant content     | MMR; deduplicate at        |
+| results                |                       | ingestion                  |
++------------------------+-----------------------+----------------------------+
+| Relevant chunk ranked  | Weak first-stage      | Retrieve more, then rerank |
+| fifth or lower         | ranking               |                            |
++------------------------+-----------------------+----------------------------+
+| Model ignores the      | Too much or poorly    | Fewer passages; best       |
+| evidence               | ordered context       | first; clearer prompt      |
++------------------------+-----------------------+----------------------------+
+| Confident answer with  | Missing refusal       | Say "I could not find      |
+| no evidence            | instruction           | this" is acceptable        |
++------------------------+-----------------------+----------------------------+
+
+9.3 Reranking in practice
+-------------------------
+
+A reranker is a model that reads the question and a passage together and outputs
+a relevance score. Because it can compare them in detail, it is more accurate
+than embedding similarity, but it is too slow to run on every chunk. The
+standard design is therefore two-stage: fetch thirty to one hundred candidates
+cheaply, then rerank them and keep the best few. Many providers offer rerank
+endpoints, and open-source cross-encoders can run on your own hardware.
+
+9.4 Query-time filters from application context
+-----------------------------------------------
+
+Often the application already knows something that narrows the search. A support
+agent works on one product, a user belongs to one department, a question
+concerns one customer. Pass these as metadata filters at retrieval time. This is
+more reliable than hoping that the embedding captures the constraint, and it is
+also the correct place to enforce access control: documents a user may not see
+should never be retrieved for that user.
+
+    ---- code ------------------------------------------------------------
+    def retriever_for(user):
+        return vs.as_retriever(search_kwargs={
+            "k": 6,
+            "filter": {"department": user["department"]},
+        })
+    ----------------------------------------------------------------------
+
+
+10. EVALUATING RAG APPLICATIONS
+===============================
+
+10.1 Evaluate the parts separately
+----------------------------------
+
+A single score for the final answer hides where the problem is. Evaluate
+retrieval and generation separately. For retrieval, you need a set of questions
+with the passages that answer them. For each question, check whether the right
+passage appears in the top results. The simple measure of this is hit rate at k:
+the fraction of questions where a correct passage is among the first k results.
+For generation, check that the answer is correct, that it is supported by the
+retrieved context, and that it addresses the question.
+
+    ---- code ------------------------------------------------------------
+    def hit_rate(dataset, retriever, k=5):
+        hits = 0
+        for item in dataset:
+            docs = retriever.invoke(item["question"])[:k]
+            found = {d.metadata["chunk_id"] for d in docs}
+            hits += bool(found & set(item["relevant_ids"]))
+        return hits / len(dataset)
+
+    print("hit rate@5:", hit_rate(eval_set, retriever))
+    ----------------------------------------------------------------------
+
+10.2 Building the evaluation set
+--------------------------------
+
+Start with fifty questions. Draw them from real user queries where you can, and
+ask domain experts for the hard ones. You can also have a model write questions
+from sampled chunks, but review them by hand, because generated questions tend
+to be unrealistically easy. Include questions that the documents cannot answer,
+so that you can test whether the system refuses correctly. Keep a frozen test
+set that you never tune against.
+
+10.3 Judging generated answers
+------------------------------
+
+Model-based judges can score faithfulness and relevance at scale. A judge is
+given the question, the retrieved context and the answer, plus a clear rubric,
+and returns a score and a reason. Validate any judge against a sample of human
+labels before trusting it, pin the judge model version, and look at individual
+failures, not only averages. Platforms such as LangSmith let you store datasets,
+run evaluations across versions of your chain and compare the results side by
+side. Libraries such as RAGAS provide ready-made metrics for faithfulness,
+answer relevance, context precision and context recall.
+
+10.4 Monitoring after launch
+----------------------------
+
+Production traffic differs from your test set. Trace every request, store the
+question, the retrieved sources, the answer and any user feedback, and review
+low-rated cases regularly. Add the failures to the evaluation set. Watch the
+fraction of questions where the system refuses, because a sudden change in
+either direction signals a problem with the index or the model.
+
+A useful habit is a weekly review meeting of ten minutes. Pick ten traces at
+random and ten with negative feedback, read the question, the retrieved passages
+and the answer, and label the cause of each failure using the stage names from
+this chapter. After a few weeks the labels show where to invest: loading,
+chunking, retrieval or prompting.
+
+
+11. TROUBLESHOOTING AND CHECKLIST
+=================================
+
+11.1 Frequent problems
+----------------------
+
++-------------------------+---------------------------------------------------+
+| Problem                 | What to check                                     |
++=========================+===================================================+
+| Empty or odd results    | Is the collection populated? Was the same         |
+|                         | embedding model used for indexing and querying?   |
++-------------------------+---------------------------------------------------+
+| Answers mention things  | Is the prompt restricting the model to the        |
+| not in the documents    | context? Is a refusal instruction present?        |
++-------------------------+---------------------------------------------------+
+| Good in testing, poor   | Does the test set reflect real user phrasing and  |
+| in production           | typos?                                            |
++-------------------------+---------------------------------------------------+
+| Slow responses          | Time each stage; reduce candidates, enable        |
+|                         | streaming, cache embeddings                       |
++-------------------------+---------------------------------------------------+
+| Rising cost             | Count tokens in the prompt; reduce the number and |
+|                         | length of passages                                |
++-------------------------+---------------------------------------------------+
+| Duplicate chunks        | Use stable identifiers and content hashes;        |
+|                         | deduplicate at ingestion                          |
++-------------------------+---------------------------------------------------+
+| Outdated answers        | Re-ingest changed documents and remove deleted    |
+|                         | ones                                              |
++-------------------------+---------------------------------------------------+
+| Wrong language answers  | Use a multilingual embedding model and test       |
+|                         | queries in each language                          |
++-------------------------+---------------------------------------------------+
+
+11.2 Ingestion checklist
+------------------------
+
+  1. Inspect loaded text by eye for several documents of each type.
+  2. Remove boilerplate and repeated headers and footers.
+  3. Choose a splitter that respects the structure of the documents.
+  4. Attach source, section and date metadata to every chunk.
+  5. Give chunks stable identifiers and keep a content hash.
+  6. Record the embedding model name and chunking settings with the index.
+  7. Make ingestion repeatable and safe to run again.
+
+11.3 Query checklist
+--------------------
+
+  1. Condense follow-up questions into standalone questions.
+  2. Retrieve more candidates than you need, then filter or rerank.
+  3. Apply metadata filters and access control at retrieval time.
+  4. Number the passages and require citations.
+  5. Allow the model to say that it could not find the answer.
+  6. Trace each request and keep the retrieved sources for debugging.
+
+11.4 Summary
+------------
+
+Retrieval-augmented generation connects a language model to your own knowledge.
+The indexing pipeline loads documents, splits them into chunks, embeds them and
+stores them with metadata. The query pipeline retrieves the most relevant chunks
+and asks the model to answer from them with citations. LangChain gives every
+stage a standard interface: loaders produce documents, splitters produce chunks,
+embeddings produce vectors, vector stores search them, retrievers return
+documents, and chains combine everything with the Runnable operators from Volume
+1. Quality depends far more on loading, splitting, retrieval and prompting than
+on the choice of model, so measure each stage separately and improve the weakest
+one. Volume 3 turns to tools and agents, where the model chooses its own
+actions, and to the practices that keep an application reliable in production.
+
+--------------------------------------------------------------------------------
+END OF DOCUMENT

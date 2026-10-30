@@ -1,0 +1,24 @@
+# Your API keys. Never commit this file.
+.env
+
+# The index is rebuilt from data/documents, so there is no need to track it.
+# (vectorstore/README.md is kept, everything the build creates is ignored.)
+vectorstore/faiss/
+vectorstore/doc_store.json
+
+# Evaluation output.
+data/evaluation/results.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+myenv/
+env/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
